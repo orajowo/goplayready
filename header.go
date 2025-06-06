@@ -1,26 +1,17 @@
 package goplayready
 
 import (
+	"encoding/base64"
 	"encoding/binary"
 	"errors"
+	"strings"
+
+	license "github.com/orajowo/goplayready/licence"
 
 	"github.com/orajowo/etree"
-	license "github.com/orajowo/goplayready/licence"
+	"golang.org/x/text/encoding/unicode"
+	"golang.org/x/text/transform"
 )
-
-func (h *Header) ParseWrm(Wrm string) error {
-	var header WrmHeader
-
-	err := header.Decode(Wrm)
-
-	if err != nil {
-		return err
-	}
-
-	h.WrmHeader = &header
-
-	return nil
-}
 
 type PlayReadyObject struct {
 	Type   uint16
@@ -51,6 +42,29 @@ type ProtectionSystemHeaderBox struct {
 	KeyIds     []license.Guid
 	Length     uint32
 	Data       []byte
+}
+
+func (p *PlayReadyObject) Decode(data []byte) bool {
+	p.Type = binary.LittleEndian.Uint16(data)
+	data = data[2:]
+	p.Length = binary.LittleEndian.Uint16(data)
+	data = data[2:]
+
+	if int(p.Length) > len(data) {
+		return false
+	}
+
+	decoder := unicode.UTF16(unicode.LittleEndian, unicode.UseBOM).NewDecoder()
+
+	decodedStr, _, err := transform.String(decoder, string(data))
+
+	if err != nil {
+		return false
+	}
+
+	p.Data = decodedStr
+
+	return true
 }
 
 func (p *PlayReadyRecord) Decode(data []byte) bool {
@@ -158,6 +172,88 @@ func (w *WrmHeader) Decode(Wrm string) error {
 	}
 
 	w.Data = ParsedWrm.Root()
+
+	return nil
+}
+
+func (h *Header) Parse(data any) error {
+	var decoded []byte
+
+	switch v := data.(type) {
+	case []byte:
+		decoded = v
+
+	case string:
+		if strings.HasPrefix(v, "<WRM") {
+			return h.ParseWrm(v)
+		}
+
+		strDecoded, err := base64.StdEncoding.DecodeString(v)
+		if err != nil {
+			return err
+		}
+		decoded = strDecoded
+
+	default:
+		return errors.New("parsed data is not of type string or []byte")
+	}
+
+	return h.ParseByte(decoded)
+}
+
+func (h *Header) ParseByte(data []byte) error {
+	if string(data[4:8]) == "pssh" {
+		var box ProtectionSystemHeaderBox
+		box.Decode(data)
+
+		h.PSSHBox = &box
+	}
+
+	if h.PSSHBox != nil && h.PSSHBox.SystemId.Uuid() != "9a04f079-9840-4286-ab92-e65be0885f95" {
+		return errors.New("pssh is not for playready")
+
+	}
+
+	PRRecord := data
+
+	if h.PSSHBox != nil {
+		PRRecord = h.PSSHBox.Data
+	}
+
+	var record PlayReadyRecord
+
+	ok := record.Decode(PRRecord)
+
+	PRObject := data
+
+	if ok == true {
+		h.Record = &record
+
+		PRObject = h.Record.Data
+	}
+
+	var Object PlayReadyObject
+
+	ok = Object.Decode(PRObject)
+	if ok == false {
+		return errors.New("unable to parse pssh")
+	}
+
+	h.Object = &Object
+
+	return h.ParseWrm(h.Object.Data)
+}
+
+func (h *Header) ParseWrm(Wrm string) error {
+	var header WrmHeader
+
+	err := header.Decode(Wrm)
+
+	if err != nil {
+		return err
+	}
+
+	h.WrmHeader = &header
 
 	return nil
 }
